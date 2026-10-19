@@ -1,0 +1,515 @@
+import os
+import re
+import io
+import json
+import zipfile
+import logging
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+import requests
+import pandas as pd
+import gradio as gr
+from smolagents import (
+    CodeAgent,
+    InferenceClientModel,
+    DuckDuckGoSearchTool,
+    VisitWebpageTool,
+    WikipediaSearchTool,
+)
+from huggingface_hub import InferenceClient
+
+# ============================================================
+# Configuration
+# ============================================================
+
+DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
+MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct:featherless-ai"
+ASR_MODEL_ID = "openai/whisper-large-v3"
+
+API_URL = os.getenv("AGENT_EVAL_API_URL", DEFAULT_API_URL).rstrip("/")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("gaia-agent")
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "GAIA-Agent/2.0"})
+
+
+# ============================================================
+# Fetch benchmark attachment
+# ============================================================
+
+def fetch_task_file(task_id):
+    """Fetch an attachment associated with a GAIA task."""
+    url = f"{API_URL}/files/{task_id}"
+
+    try:
+        response = SESSION.get(url, timeout=60)
+        if response.status_code == 404:
+            logger.info("No attachment for task %s", task_id)
+            return None, None
+
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        content = response.content
+
+        if "json" in content_type:
+            try:
+                payload = response.json()
+
+                for key in ("file_url", "url", "download_url"):
+                    if payload.get(key):
+                        file_response = SESSION.get(payload[key], timeout=90)
+                        file_response.raise_for_status()
+                        return file_response.content, payload.get("filename", "")
+
+                if payload.get("content"):
+                    return payload["content"].encode("utf-8"), payload.get("filename", "")
+
+                logger.warning("Attachment endpoint returned JSON without file data.")
+                return None, None
+            except (ValueError, TypeError):
+                pass
+
+        disposition = response.headers.get("Content-Disposition", "")
+        match = re.search(r'filename="?([^";]+)', disposition)
+        filename = match.group(1) if match else ""
+        logger.info("Fetched attachment for %s: %s bytes", task_id, len(content))
+        return content, filename
+
+    except Exception:
+        logger.exception("Could not fetch attachment for %s", task_id)
+        return None, None
+
+
+# ============================================================
+# Audio transcription
+# ============================================================
+
+def transcribe_audio(file_bytes):
+    """Transcribe audio using the Hugging Face Inference API."""
+    if not file_bytes:
+        return ""
+    if not HF_TOKEN:
+        logger.warning("HF_TOKEN missing; cannot transcribe audio.")
+        return ""
+
+    try:
+        client = InferenceClient(
+            model=ASR_MODEL_ID,
+            token=HF_TOKEN,
+            timeout=180,
+        )
+        result = client.automatic_speech_recognition(audio=file_bytes)
+        transcript = result.get("text", "") if isinstance(result, dict) else str(result)
+        transcript = transcript.strip()
+        logger.info("Audio transcription completed (%s characters).", len(transcript))
+        return transcript
+    except Exception:
+        logger.exception("Audio transcription failed")
+        return ""
+
+
+# ============================================================
+# Extract text from common attachments
+# ============================================================
+
+def decode_text(data):
+    if not data:
+        return ""
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
+def extract_attachment_text(file_bytes, filename=""):
+    """Extract text from common attachment types."""
+    if not file_bytes:
+        return ""
+
+    ext = Path(filename).suffix.lower() if filename else ""
+
+    audio_extensions = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
+    if ext in audio_extensions:
+        transcript = transcribe_audio(file_bytes)
+        if transcript:
+            return "TRANSCRIBED AUDIO CONTENT:\n" + transcript
+        return (
+            "Audio attachment detected, but transcription failed. "
+            "Do not invent its contents."
+        )
+
+    if ext == ".pdf" or file_bytes[:4] == b"%PDF":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            pages = [
+                f"[Page {i + 1}]\n{page.extract_text() or ''}"
+                for i, page in enumerate(reader.pages)
+            ]
+            extracted = "\n\n".join(pages).strip()
+            return extracted or (
+                "The PDF has no extractable text. It may require OCR or visual processing."
+            )
+        except Exception:
+            logger.exception("PDF extraction failed")
+            return ""
+
+    if ext == ".docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+                xml_data = archive.read("word/document.xml")
+            root = ET.fromstring(xml_data)
+            namespace = {
+                "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            }
+            paragraphs = []
+            for paragraph in root.findall(".//w:p", namespace):
+                text = "".join(
+                    node.text or "" for node in paragraph.findall(".//w:t", namespace)
+                )
+                if text.strip():
+                    paragraphs.append(text)
+            return "\n".join(paragraphs)
+        except Exception:
+            logger.exception("DOCX extraction failed")
+            return ""
+
+    if ext in (".xlsx", ".xls"):
+        try:
+            workbook = pd.ExcelFile(io.BytesIO(file_bytes))
+            sheets = []
+            for sheet_name in workbook.sheet_names:
+                frame = pd.read_excel(workbook, sheet_name=sheet_name, header=None)
+                sheets.append(
+                    f"Sheet: {sheet_name}\n"
+                    + frame.fillna("").to_string(index=False, header=False)
+                )
+            return "\n\n".join(sheets)
+        except Exception:
+            logger.exception("Spreadsheet extraction failed")
+            return ""
+
+    if ext == ".csv":
+        try:
+            return pd.read_csv(io.BytesIO(file_bytes)).to_string(index=False)
+        except Exception:
+            return decode_text(file_bytes)
+
+    if ext == ".json":
+        try:
+            return json.dumps(
+                json.loads(decode_text(file_bytes)), indent=2, ensure_ascii=False
+            )
+        except Exception:
+            return decode_text(file_bytes)
+
+    if ext in (".html", ".htm"):
+        try:
+            from markdownify import markdownify
+            return markdownify(decode_text(file_bytes))
+        except Exception:
+            return decode_text(file_bytes)
+
+    text_extensions = {
+        ".txt", ".md", ".py", ".js", ".jsonl", ".xml", ".yaml", ".yml",
+        ".log", ".tex", ".r", ".sql", ".java", ".c", ".cpp",
+    }
+    if ext in text_extensions:
+        return decode_text(file_bytes)
+
+    if not ext:
+        decoded = decode_text(file_bytes)
+        if decoded and "\x00" not in decoded[:1000]:
+            return decoded
+
+    return f"Attachment format '{ext or 'unknown'}' is not supported by the text extractor."
+
+
+# ============================================================
+# Agent creation
+# ============================================================
+
+def build_agent():
+    if not HF_TOKEN:
+        raise RuntimeError(
+            "HF_TOKEN is missing. Add it as a Space secret under Settings > Secrets."
+        )
+
+    model = InferenceClientModel(
+        model_id=MODEL_ID,
+        token=HF_TOKEN,
+        provider="auto",
+        max_tokens=2048,
+    )
+
+    tools = [
+        DuckDuckGoSearchTool(),
+        VisitWebpageTool(),
+        WikipediaSearchTool(
+            user_agent="GAIAAgent/2.0 (educational project)",
+            language="en",
+            content_type="text",
+        ),
+    ]
+
+    return CodeAgent(
+        tools=tools,
+        model=model,
+        max_steps=18,
+        verbosity_level=0,
+    )
+
+
+# ============================================================
+# Answer cleanup and validation
+# ============================================================
+
+def clean_answer(raw_answer):
+    if raw_answer is None:
+        return ""
+
+    answer = str(raw_answer).strip()
+
+    answer = re.sub(
+        r"\A```[^\n]*\n(.*?)\n```\Z",
+        r"\1",
+        answer,
+        flags=re.DOTALL,
+    ).strip()
+
+    answer = re.sub(
+        r"\A(?:final answer|answer)\s*:\s*",
+        "",
+        answer,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if len(answer) >= 2:
+        if answer[0] == answer[-1] and answer[0] in ("'", '"'):
+            answer = answer[1:-1].strip()
+
+    return answer
+
+
+def looks_like_tool_trace(answer):
+    lower = answer.lower()
+    markers = (
+        "calling tools:",
+        "calling tool:",
+        "function_call",
+        "python_interpreter",
+        "let's try this approach",
+        "transcript_or_summary =",
+        "print(",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def solve_question(agent, question, attachment_text=""):
+    prompt = f"""
+You are answering a GAIA benchmark question.
+QUESTION:
+{question}
+ATTACHMENT CONTENT:
+{attachment_text if attachment_text else "[No readable attachment text supplied]"}
+Instructions:
+- Identify exactly what the question asks for.
+- Determine whether it requires research, attachment analysis,
+  calculation, or multiple steps.
+- Search for specific facts and open relevant webpages.
+- Prefer primary sources and verify important claims.
+- For multi-step questions, verify each fact before combining results.
+- Calculate numerical answers from the actual data.
+- For spreadsheets, inspect relevant columns, rows, and sheets.
+- For source code, trace execution and determine the actual output.
+- Never invent missing attachment content.
+- Follow the exact format requested by the question.
+- Return only the requested answer, without explanation or labels
+  unless explicitly requested.
+"""
+    result = agent.run(prompt)
+    answer = clean_answer(result)
+
+    if looks_like_tool_trace(answer) or len(answer) > 1200:
+        logger.warning("Answer may contain tool traces; retrying with strict format.")
+        retry_prompt = f"""
+The following was an invalidly formatted response to a question.
+QUESTION:
+{question}
+ATTACHMENT CONTENT:
+{attachment_text if attachment_text else "[No readable attachment text]"}
+PREVIOUS RESPONSE:
+{answer[:4000]}
+Extract the actual answer if it is clearly supported by the previous response or attachment.
+Do not repeat the research process. Follow the question's requested format and return only the answer.
+If the answer cannot be determined from the available evidence, do not invent one.
+Return the best supported answer only.
+"""
+        try:
+            retry_answer = clean_answer(agent.run(retry_prompt))
+            if retry_answer and not looks_like_tool_trace(retry_answer) and len(retry_answer) <= 1200:
+                answer = retry_answer
+        except Exception:
+            logger.exception("Answer-format retry failed")
+
+    return clean_answer(answer)
+
+
+# ============================================================
+# Fetch questions and submit results
+# ============================================================
+
+def run_and_submit_all(profile: gr.OAuthProfile | None):
+    """Run all benchmark tasks and submit answers; report failures in the UI.
+    Gradio injects OAuthProfile into this function when it is declared as a
+    function parameter. OAuthProfile is not a UI component and must not be
+    instantiated manually.
+    """
+    logger.info("Callback started; profile type=%s", type(profile).__name__)
+
+    if profile is None:
+        return "Please log in with Hugging Face first.", pd.DataFrame()
+
+    # In current Gradio versions OAuthProfile exposes attributes such as
+    # username and name. It is also dict-compatible in supported versions.
+    username = getattr(profile, "username", None) or getattr(profile, "name", None)
+    if not username and isinstance(profile, dict):
+        username = profile.get("preferred_username") or profile.get("username") or profile.get("name")
+    space_id = os.getenv("SPACE_ID")
+
+    if not username:
+        return "Could not identify the logged-in Hugging Face user.", pd.DataFrame()
+
+    if not space_id:
+        return (
+            "SPACE_ID is missing. Add it as a Space secret, e.g. username/space-name.",
+            pd.DataFrame(),
+        )
+
+    try:
+        response = SESSION.get(f"{API_URL}/questions", timeout=60)
+        response.raise_for_status()
+        tasks = response.json()
+    except Exception as exc:
+        logger.exception("Could not fetch benchmark questions")
+        return f"Could not fetch questions: {exc}", pd.DataFrame()
+
+    if not isinstance(tasks, list) or not tasks:
+        return "The question endpoint returned no tasks.", pd.DataFrame()
+
+    try:
+        agent = build_agent()
+    except Exception as exc:
+        logger.exception("Agent initialization failed")
+        return f"Could not initialize agent: {type(exc).__name__}: {exc}", pd.DataFrame()
+
+    answers_payload = []
+    results = []
+
+    for index, task in enumerate(tasks, start=1):
+        task_id = task.get("task_id") or task.get("id")
+        question = task.get("Question") or task.get("question", "")
+
+        if not task_id or not question:
+            logger.warning("Skipping malformed task: %s", task)
+            continue
+
+        logger.info("Solving task %s (%s/%s)", task_id, index, len(tasks))
+        filename = ""
+
+        try:
+            file_bytes, filename = fetch_task_file(task_id)
+            attachment_text = extract_attachment_text(file_bytes, filename or "")
+            logger.info(
+                "Attachment diagnostics: task=%s, filename=%r, "
+                "bytes=%s, extracted_chars=%s",
+                task_id,
+                filename,
+                len(file_bytes) if file_bytes else 0,
+                len(attachment_text),
+            )
+            logger.info(
+                "Task %s attachment=%s; extracted characters=%s",
+                task_id, filename or "none", len(attachment_text),
+            )
+            answer = solve_question(agent, question, attachment_text)
+        except Exception as exc:
+            logger.exception("Failed to solve task %s", task_id)
+            answer = ""
+            error_note = f"Task failed: {type(exc).__name__}: {exc}"
+        else:
+            error_note = ""
+
+        answers_payload.append({"task_id": task_id, "submitted_answer": answer})
+        results.append({
+            "Task ID": task_id,
+            "Question": question,
+            "Submitted Answer": answer,
+            "Attachment": filename,
+            "Error": error_note,
+        })
+
+    if not answers_payload:
+        return "No valid answers were generated.", pd.DataFrame(results)
+
+    payload = {
+        "username": username,
+        "agent_code": f"https://huggingface.co/spaces/{space_id}/tree/main",
+        "answers": answers_payload,
+    }
+
+    try:
+        submit_response = SESSION.post(
+            f"{API_URL}/submit",
+            json=payload,
+            timeout=120,
+        )
+        submit_response.raise_for_status()
+        try:
+            submission_result = submit_response.json()
+        except ValueError:
+            submission_result = {"response": submit_response.text}
+
+        logger.info("Submission response: %s", submission_result)
+        status = "Submission response:\n" + json.dumps(submission_result, indent=2)
+    except Exception as exc:
+        logger.exception("Submission failed")
+        status = f"Submission failed: {type(exc).__name__}: {exc}"
+
+    return status, pd.DataFrame(results)
+
+
+# ============================================================
+# Gradio interface
+# ============================================================
+
+with gr.Blocks(title="GAIA Benchmark Agent") as demo:
+    gr.Markdown("# GAIA Benchmark Agent")
+    gr.Markdown(
+        "Research questions, process supported attachments, transcribe audio, "
+        "and submit concise answers."
+    )
+
+    # OAuthProfile is injected into callback functions by Gradio; it is not
+    # instantiated as a component and must not be passed via inputs=.
+    gr.LoginButton("Login with Hugging Face")
+
+    run_button = gr.Button("Run benchmark and submit answers", variant="primary")
+    status_output = gr.Textbox(label="Submission status", lines=6)
+    results_output = gr.Dataframe(label="Generated answers", interactive=False)
+
+    run_button.click(
+        fn=run_and_submit_all,
+        inputs=None,
+        outputs=[status_output, results_output],
+    )
+
+if __name__ == "__main__":
+    demo.launch()
